@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+
+
+# pylint: disable=missing-docstring
+class Stash:
+
+    def __init__(self, path):
+        self.data = {}
+        self.path = path
+
+    def get(self, key):
+        return self.data[key]
+
+    def set(self, key, value):
+        uid = hashlib.md5()
+        uid.update(key.encode('utf-8'))
+        uid.update(time.strftime('%c').encode('utf-8'))
+        key = uid.hexdigest()
+        self.data[key] = base64.b64encode(value.encode('utf-8')).decode()
+        return key
+
+    def read(self):
+        self.data = json.load(open(self.path, 'r'))
+        return self.data
+
+    def wipe(self):
+        os.remove(self.path)
+
+    def write(self):
+        json.dump(self.data, open(self.path, 'w'))
+
+
+def pipe(func):
+    def pipe_wrapper(slf):
+        stdin = sys.stdin.read()
+        stdout = func(slf, stdin)
+        sys.stdout.write(stdout)
+    return pipe_wrapper
+
+
+def patterns(pattern_file):
+    pattern_text = pattern_file.read()
+    for pattern in [x.strip() for x in pattern_text.strip().split('\n\n')]:
+        yield Pattern(pattern)
+
+
+class Pattern:
+
+    def __init__(self, pattern_text):
+        self.flags = 0
+        self.regex = None
+        self.format_string = '{key}{uid}'
+        for pair in pattern_text.strip().split('\n'):
+            if not pair.strip() or pair.strip()[0] in ('#', '[', '/'):
+                continue
+            key, value = [p.strip() for p in pair.split('=', 1)]
+            if key == 'regex':
+                self.regex = r'('+value+r')'
+            elif key == 'format':
+                self.format_string = value
+            elif key == 'ignore_case' and value == 'true':
+                self.flags += re.I
+            elif key == 'multiline' and value == 'true':
+                self.flags += re.M
+
+    def format(self, key, uid):
+        return self.format_string.format(key=key, uid=uid)
+
+
+class Filter:
+
+    def __init__(self, pattern_file, stash):
+        self.patterns = patterns(pattern_file)
+        self.stash = stash
+
+    @pipe
+    def smudge(self, stdin):
+        for pattern in self.patterns:
+            for original, prefix, *_, target in re.findall(
+                    pattern.regex,
+                    stdin,
+                    pattern.flags
+                ):
+                uid = self.stash.set(prefix, target)
+                stdin = stdin.replace(
+                    original,
+                    pattern.format(key=prefix, uid=uid)
+                    )
+        self.stash.write()
+        return stdin
+
+    @pipe
+    def clean(self, stdin):
+        for key, value in self.stash.read().items(): # pylint: disable=no-member
+            stdin = stdin.replace(key, base64.b64decode(value).decode())
+        self.stash.write()
+        return stdin
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()  # pylint: disable=invalid-name
+    parser.add_argument(
+        '--patterns',
+        type=argparse.FileType('r'),
+        default='generic.ini'
+        )
+    parser.add_argument('--stash', type=argparse.FileType('a'))
+    parser.add_argument('--clean', action='store_true', default=False)
+    parser.add_argument('--smudge', action='store_true', default=False)
+    args = parser.parse_args()  # pylint: disable=invalid-name
+    filters = Filter(args.patterns, Stash(args.stash.name))  # pylint: disable=invalid-name
+    if args.clean:
+        filters.clean()  # @pipe # pylint: disable=no-value-for-parameter
+    elif args.smudge:
+        filters.smudge()  # @pipe # pylint: disable=no-value-for-parameter
